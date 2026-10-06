@@ -4,7 +4,7 @@
 - 所有时间字段必须带时区偏移（naive datetime 直接 422）；
 - 必填字段缺失同样 422，错误体在 main 中统一为 {"error": {...}}。
 """
-from datetime import datetime
+from datetime import datetime, time
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -86,3 +86,34 @@ class ClaimSubmitRequest(BaseModel):
         if v is not None:
             _aware(v, "received_at")
         return v
+
+
+class CalendarDiagnoseRequest(BaseModel):
+    """节假日表工作日诊断入参（只读）。"""
+    calendar_code: str = Field(min_length=1, description="已有节假日表代码，如 CN")
+    timezone: str = Field(min_length=1, description="IANA 时区名，如 Asia/Shanghai")
+    start_at: datetime = Field(
+        description="带偏移的起始时刻，如 2025-09-30T18:00:00+08:00；自其当地日期次日起数")
+    business_days: int = Field(ge=1, le=60, description="需要数出的工作日数，1～60")
+    cutoff: str = Field(
+        min_length=5, max_length=8,
+        description="当地截止钟点 HH:MM 或 HH:MM:SS（00:00:00～23:59:59），如 18:00:00")
+
+    @field_validator("start_at")
+    @classmethod
+    def _start_tz(cls, v):
+        return _aware(v, "start_at")
+
+    @field_validator("cutoff")
+    @classmethod
+    def _cutoff(cls, v):
+        parts = v.split(":")
+        if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
+            raise ValueError("截止钟点格式必须为 HH:MM 或 HH:MM:SS")
+        h, m = int(parts[0]), int(parts[1])
+        s = int(parts[2]) if len(parts) == 3 else 0
+        try:
+            time(h, m, s)          # 范围校验：24:00 / 18:60 等非法值在此拒绝
+        except ValueError:
+            raise ValueError("截止钟点超出合法范围（小时 0-23、分钟/秒 0-59）")
+        return f"{h:02d}:{m:02d}:{s:02d}"

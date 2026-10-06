@@ -9,10 +9,12 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .errors import AppError
-from .schemas import (ClaimSubmitRequest, CreateOrderRequest, EventBatchRequest,
-                      EventIn, EventPreviewRequest)
-from .services import (archive_determination, create_order, determination_history,
-                       get_voucher, ingest_events, list_events, list_vouchers,
+from .schemas import (CalendarDiagnoseRequest, ClaimSubmitRequest,
+                      CreateOrderRequest, EventBatchRequest, EventIn,
+                      EventPreviewRequest)
+from .services import (archive_determination, create_order,
+                       determination_history, diagnose_calendar, get_voucher,
+                       ingest_events, list_events, list_vouchers,
                        live_determination, preview_events, submit_claim)
 
 
@@ -24,8 +26,9 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="快递理赔时限判定服务",
-    version="1.1.0",
-    description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重、迟到更正与幂等理赔申请凭证。",
+    version="1.2.0",
+    description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重、"
+                "迟到更正与幂等理赔申请凭证；并提供只读的节假日表工作日诊断。",
     lifespan=lifespan,
 )
 
@@ -197,3 +200,16 @@ def api_calendar(calendar_code: str):
     if not rows:
         raise AppError("CALENDAR_NOT_FOUND", f"节假日表不存在: {calendar_code}", 404)
     return {"calendar_code": calendar_code, "days": [dict(r) for r in rows]}
+
+
+@app.post("/api/v1/calendars/diagnose")
+def api_diagnose_calendar(req: CalendarDiagnoseRequest):
+    """节假日表工作日诊断（只读）：自起始时刻当地日期次日起逐日列出工作/休息
+    判定、补班/放假声明、周末默认规则、累计工作日数与跳过原因，直到第 N 个
+    工作日，返回当地与 UTC 截止时刻。不修改日历、政策、订单或凭证。
+
+    - 起始时间必须带时区偏移，否则 422；
+    - 日历不存在 404，时区无法识别 422；
+    - 工作日数须为 1～60，截止钟点须为合法 HH:MM(:SS)，否则 422。
+    """
+    return diagnose_calendar(req)

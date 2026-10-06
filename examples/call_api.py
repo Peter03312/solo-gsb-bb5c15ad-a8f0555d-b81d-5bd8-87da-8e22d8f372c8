@@ -12,7 +12,8 @@
 6. 正式提交该更正事件 -> 产生第 2 代新判定，与预演结果一致，第 1 代快照不变；
 7. 查询判定历史；
 8. 理赔申请：按接收时间核验受理并生成不可变凭证（含幂等重试/换类型冲突/
-   同类型重复受理/非 filable 拒绝/凭证查询）。
+   同类型重复受理/非 filable 拒绝/凭证查询）；
+9. 节假日表工作日诊断：只读逐日列出工作/休息判定与截止时刻（含非法参数拒绝）。
 """
 import json
 import os
@@ -142,8 +143,45 @@ def main():
                   f"状态={status} | supersedes={g['supersedes_generation']}")
 
     claim_demo()
+    calendar_diagnose_demo()
 
     print("\n示例完成。交互文档：" + BASE + "/docs")
+
+
+def calendar_diagnose_demo():
+    """节假日表工作日诊断（只读）：独立于订单，逐日解释第 N 个工作日如何得出。"""
+    print("\n\n########## 节假日表工作日诊断演示 ##########")
+    payload = {
+        "calendar_code": "CN",
+        "timezone": "Asia/Shanghai",
+        "start_at": "2025-09-30T10:00:00+08:00",   # 必须带偏移；自当地日期次日起数
+        "business_days": 10,                        # 1～60
+        "cutoff": "18:00",                          # HH:MM 或 HH:MM:SS
+    }
+    r = call("POST", "/api/v1/calendars/diagnose", payload)
+    if r is None:
+        return
+    print(f"日历 {r['calendar_code']}（声明日期 {r['calendar_declared_days']} 个）| "
+          f"时区 {r['timezone']} | {r['count_basis']}")
+    print(f"起始当地时刻 {r['start_at_local']}（UTC {r['start_at_utc']}），"
+          f"自 {r['count_start_date']} 起逐日列出：")
+    for e in r["entries"]:
+        decl = f"[{e['declaration']['name']}]" if e["declaration"] else ""
+        print(f"  {e['date']} {e['weekday']} {e['verdict']} "
+              f"累计第 {e['business_day_count']} 个工作日 {decl} - {e['reason']}")
+    s = r["summary"]
+    print(f"汇总：列出 {s['days_listed']} 天，其中工作日 {s['business_days_counted']}、"
+          f"休息 {s['rest_days_seen']}（放假 {s['declared_holidays_seen']}、"
+          f"补班上班 {s['declared_makeup_workdays_seen']}）")
+    print(f"第 10 个工作日截止：当地 {r['deadline_local']} | UTC {r['deadline_utc']}")
+    print(f"只读：{r['note']}")
+
+    # 非法参数示例：时间无偏移 / 日历不存在 / 钟点非法，均被明确拒绝
+    print("\n--- 非法参数拒绝示例 ---")
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "start_at": "2025-09-30T10:00:00"})
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "calendar_code": "ZZ"})
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "business_days": 61})
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "cutoff": "18:60"})
 
 
 def claim_demo():

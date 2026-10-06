@@ -8,7 +8,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from . import constants as C
 from . import db
 from .db import q, q1
-from .engine import evaluate, parse_dt, resolve_policy, to_local, utc_now
+from .engine import (diagnose_business_days, evaluate, parse_cutoff, parse_dt,
+                     resolve_policy, to_local, utc_now)
 from .errors import AppError
 from .schemas import CreateOrderRequest, EventIn
 
@@ -796,3 +797,47 @@ def list_vouchers(order_id: str) -> dict:
         (order_id,),
     )
     return {"order_id": order_id, "vouchers": [_voucher_payload(r) for r in rows]}
+
+
+# ---------------------------------------------------------------- 节假日表诊断（只读）
+
+def diagnose_calendar(req) -> dict:
+    """节假日表工作日诊断：只读现有日历并逐日给出判定，不写任何数据。
+
+    - 日历不存在 -> 404 CALENDAR_NOT_FOUND；时区不存在 -> 422 TIMEZONE_INVALID；
+    - 时间缺少偏移、天数/钟点非法在请求模型层 422 拒绝；
+    - 全程只读，不修改日历、政策、订单或凭证。
+    """
+    cal_row = q1(
+        "SELECT 1 FROM calendars WHERE calendar_code = ? LIMIT 1",
+        (req.calendar_code,),
+    )
+    if cal_row is None:
+        raise AppError(
+            "CALENDAR_NOT_FOUND",
+            f"节假日表不存在: {req.calendar_code}，请先初始化或使用已有日历代码",
+            404,
+        )
+    try:
+        ZoneInfo(req.timezone)
+    except ZoneInfoNotFoundError:
+        raise AppError("TIMEZONE_INVALID", f"无法识别的时区: {req.timezone}", 422)
+
+    rows = q(
+        "SELECT date, kind, name FROM calendars WHERE calendar_code = ?",
+        (req.calendar_code,),
+    )
+    cal = {r["date"]: (r["kind"], r["name"]) for r in rows}
+
+    result = diagnose_business_days(
+        start_utc=parse_dt(req.start_at),
+        n=req.business_days,
+        cutoff=parse_cutoff(req.cutoff),
+        tzname=req.timezone,
+        cal=cal,
+    )
+    return {
+        "calendar_code": req.calendar_code,
+        "calendar_declared_days": len(cal),
+        **result,
+    }

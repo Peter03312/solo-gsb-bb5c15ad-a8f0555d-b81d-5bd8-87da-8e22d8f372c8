@@ -12,7 +12,8 @@
 6. 正式提交该更正事件 -> 产生第 2 代新判定，与预演结果一致，第 1 代快照不变；
 7. 查询判定历史；
 8. 理赔申请：按接收时间核验受理并生成不可变凭证（含幂等重试/换类型冲突/
-   同类型重复受理/非 filable 拒绝/凭证查询）。
+   同类型重复受理/非 filable 拒绝/凭证查询）；
+9. 节假日表诊断：只读逐日推算工作日（国庆黄金周跳过、周末补班计入）与参数拒绝。
 """
 import json
 import os
@@ -142,6 +143,7 @@ def main():
                   f"状态={status} | supersedes={g['supersedes_generation']}")
 
     claim_demo()
+    calendar_diagnose_demo()
 
     print("\n示例完成。交互文档：" + BASE + "/docs")
 
@@ -238,6 +240,61 @@ def claim_demo():
     lst = call("GET", f"/api/v1/orders/{oid}/claims")
     if lst:
         print(f"  订单 {oid} 已有凭证 {len(lst['vouchers'])} 张（同类型至多一张）")
+
+
+def calendar_diagnose_demo():
+    """节假日表诊断（只读）：逐日判定、补班/放假、跳过原因与当地/UTC 截止时刻。"""
+    print("\n\n########## 节假日表诊断（只读）演示 ##########")
+
+    # 1) 国庆黄金周：2025-10-01 起算 10 个工作日，截止 10-21 18:00（+08:00）
+    payload = {
+        "calendar_code": "CN",
+        "timezone": "Asia/Shanghai",
+        "start_at": "2025-10-01T10:00:00+08:00",   # 必须带时区偏移
+        "business_days": 10,                        # 1～60
+        "cutoff": "18:00",                          # HH:MM 或 HH:MM:SS
+    }
+    r = call("POST", "/api/v1/calendars/diagnose", payload)
+    print("\n--- 1) 国庆+中秋黄金周起算 10 个工作日（只读逐日诊断） ---")
+    if r:
+        print(f"  起算当地日 {r['start_date_local']}（不计入），自 {r['count_from']} 起逐日枚举")
+        print(f"  第 {r['business_days_counted']} 个工作日：{r['nth_business_day']}")
+        print(f"  当地截止 {r['deadline_local']} | UTC 截止 {r['deadline_utc']}")
+        print(f"  共枚举 {r['days_enumerated']} 天，其中休息跳过 {r['rest_days_skipped']} 天")
+        print("  逐日明细：")
+        for d in r["days"]:
+            mark = "班" if d["kind"] == "work" else "休"
+            decl = f"[{d['declaration']}:{d['declaration_name']}]" if d["declaration"] else ""
+            tail = d["skip_reason"] if d["kind"] == "rest" else f"累计第 {d['cumulative_business_days']} 个工作日"
+            print(f"    {d['date']} {d['weekday']} {mark} {decl} {tail}")
+
+    # 2) 周末补班计入：2025-01-23 起 2 个工作日 => 01-26（周日调休上班）
+    r2 = call("POST", "/api/v1/calendars/diagnose", {
+        "calendar_code": "CN",
+        "timezone": "Asia/Shanghai",
+        "start_at": "2025-01-23T09:00:00+08:00",
+        "business_days": 2,
+        "cutoff": "23:59:59",
+    })
+    print("\n--- 2) 春节调休：周日补班计入工作日 ---")
+    if r2:
+        print(f"  第 2 个工作日：{r2['nth_business_day']} | 当地截止 {r2['deadline_local']}")
+        for d in r2["days"]:
+            print(f"    {d['date']} {d['weekday']} {'班' if d['kind'] == 'work' else '休'} "
+                  f"{d['declaration'] or '周末默认'} | {d['reason']}")
+
+    # 3) 参数拒绝：时间无偏移 / 天数超范围 / 钟点非法 / 时区或日历不存在
+    print("\n--- 3) 非法参数明确拒绝（均不改任何数据） ---")
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "start_at": "2025-10-01T10:00:00"})
+    print("    ^ 时间无偏移：期望 422 INVALID_REQUEST")
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "business_days": 61})
+    print("    ^ 工作日数 61：期望 422 INVALID_REQUEST")
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "cutoff": "24:00"})
+    print("    ^ 截止钟点 24:00：期望 422 INVALID_REQUEST")
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "timezone": "Asia/NoSuchCity"})
+    print("    ^ 时区不存在：期望 422 TIMEZONE_INVALID")
+    call("POST", "/api/v1/calendars/diagnose", {**payload, "calendar_code": "ZZ"})
+    print("    ^ 日历不存在：期望 404 CALENDAR_NOT_FOUND")
 
 
 if __name__ == "__main__":

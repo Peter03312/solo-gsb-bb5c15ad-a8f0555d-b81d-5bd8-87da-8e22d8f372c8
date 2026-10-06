@@ -8,9 +8,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from . import constants as C
 from . import db
 from .db import q, q1
-from .engine import evaluate, parse_dt, resolve_policy, to_local, utc_now
+from .engine import (calendar_exists, diagnose_calendar as _diagnose_calendar,
+                     evaluate, parse_cutoff, parse_dt, resolve_policy, to_local,
+                     utc_now)
 from .errors import AppError
-from .schemas import CreateOrderRequest, EventIn
+from .schemas import CalendarDiagnoseRequest, CreateOrderRequest, EventIn
 
 WINDOW_RULE_NOTE = "迟到更正事件仅能产生新一代判定，不修改已归档结果"
 
@@ -796,3 +798,42 @@ def list_vouchers(order_id: str) -> dict:
         (order_id,),
     )
     return {"order_id": order_id, "vouchers": [_voucher_payload(r) for r in rows]}
+
+
+# ---------------------------------------------------------------- 节假日表诊断（只读）
+
+def diagnose_calendar(req: CalendarDiagnoseRequest) -> dict:
+    """节假日表诊断：读取现有日历，从起始日次日起逐日列出工作/休息判定。
+
+    纯只读操作：不修改日历、政策、订单或凭证。
+    时区无法识别 / 日历不存在 / 时间无偏移 / 天数或钟点无效时明确拒绝。
+    """
+    try:
+        ZoneInfo(req.timezone)
+    except ZoneInfoNotFoundError:
+        raise AppError("TIMEZONE_INVALID", f"无法识别的时区标识: {req.timezone}", 422)
+
+    if not calendar_exists(req.calendar_code):
+        raise AppError(
+            "CALENDAR_NOT_FOUND",
+            f"节假日表不存在: {req.calendar_code}，请先初始化或使用已有日历代码",
+            404,
+        )
+
+    try:
+        start_utc = parse_dt(req.start_at)
+    except ValueError as exc:
+        raise AppError("INVALID_REQUEST", str(exc), 422)
+
+    try:
+        return _diagnose_calendar(
+            start_utc=start_utc,
+            tzname=req.timezone,
+            calendar_code=req.calendar_code,
+            business_days=int(req.business_days),
+            cutoff=parse_cutoff(req.cutoff),
+        )
+    except RuntimeError as exc:
+        # 日历数据异常（例如补班声明缺失导致长期数不满工作日）：明确报错而非内部错误
+        raise AppError("CALENDAR_DATA_INVALID", str(exc), 422,
+                       {"calendar_code": req.calendar_code})

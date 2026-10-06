@@ -6,7 +6,8 @@
 - 各理赔类型的**截止时间**（当地时间 + UTC）；
 - **缺失证据**清单；
 - 逐条可审计的**判定依据**（含适用政策版本、起算事件、跳节假日说明、更正记录）；
-- **理赔申请受理**：按服务实际接收时间实时核验并出具不可变申请凭证（幂等受理、同类型唯一、可查询）。
+- **理赔申请受理**：按服务实际接收时间实时核验并出具不可变申请凭证（幂等受理、同类型唯一、可查询）；
+- **节假日表诊断**：只读地逐日列出工作日/休息日判定（含补班计入、放假跳过、周末默认规则与累计工作日数），并给出第 N 个工作日的当地与 UTC 截止时刻。
 
 ## 判定规则
 
@@ -85,15 +86,15 @@ app/
   config.py        # 环境变量配置（数据目录、默认截止钟点）
   constants.py     # 事件/理赔类型与中文标签
   db.py            # SQLite 连接、建表（含不可变 claim_vouchers）、串行化写事务
-  engine.py        # 纯函数核心：政策选取/工作日推算/事件物化/判定
+  engine.py        # 纯函数核心：政策选取/工作日推算/节假日表诊断/事件物化/判定
   errors.py        # 业务错误码
-  schemas.py       # Pydantic 入参模型与时区校验
+  schemas.py       # Pydantic 入参模型与时区/钟点校验
   seed_data.py     # 政策版本 + CN 2024/2025 节假日种子
-  services.py      # 订单、事件摄取、归档/开代、判定装配、理赔申请受理/查询
+  services.py      # 订单、事件摄取、归档/开代、判定装配、理赔申请受理/查询、日历诊断
   main.py          # FastAPI 路由
 init_db.py         # 初始化入口（建表 + 种子，幂等）
-examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请全链路）
-tests/             # pytest 引擎单测 + API 端到端测试（68 个用例）
+examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请与节假日表诊断全链路）
+tests/             # pytest 引擎单测 + API 端到端测试（88 个用例）
 Dockerfile, docker-compose.yml
 ```
 
@@ -159,6 +160,7 @@ pytest -q
 | GET | `/api/v1/claims/{claim_no}` | 按申请编号查凭证及其判定代号/冻结依据 |
 | GET | `/api/v1/policies` | 政策版本列表 |
 | GET | `/api/v1/calendars/{code}` | 节假日表 |
+| POST | `/api/v1/calendars/diagnose` | **节假日表诊断（只读）**：逐日列出工作/休息判定直到第 N 个工作日，返回当地与 UTC 截止时刻 |
 
 `as_of` 为可选判定基准时刻（带偏移的 ISO8601），缺省取服务当前 UTC 时间——便于回溯测试。
 
@@ -353,6 +355,76 @@ curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/claims \
 
 > 说明：申请受理不会归档或推进任何"代"；当前代归档与否都按接收时间现算。凭证是只追加（insert-only）数据，无更新/删除接口。
 
+### 节假日表诊断（只读）
+
+`POST /api/v1/calendars/diagnose` 在**不创建订单、不读取政策、不修改任何数据**的前提下，直接对现有节假日表做逐日推算，便于核对日历配置（放假/补班声明是否正确）。
+
+请求提交五项输入：
+
+| 字段 | 说明 |
+|---|---|
+| `calendar_code` | 现有节假日表代码（如 `CN`），不存在返回 404 `CALENDAR_NOT_FOUND` |
+| `timezone` | IANA 时区标识（如 `Asia/Shanghai`、`America/New_York`），无法识别返回 422 `TIMEZONE_INVALID` |
+| `start_at` | **带时区偏移**的起始时刻（ISO8601）；naive 时间一律 422 `INVALID_REQUEST`。诊断按其在提交时区的当地日期、从**次日**起展开（起始日不计入） |
+| `business_days` | 工作日个数，整数 **1～60**，越界/非整数返回 422 |
+| `cutoff` | 第 N 个工作日当天的**当地截止钟点**，`HH:MM` 或 `HH:MM:SS`（00:00:00～23:59:59），非法返回 422 |
+
+逐日判定规则（与理赔引擎同一套口径）：
+
+1. 日历表显式声明优先：`workday`（补班）即使落在周六周日也**计入**；`holiday`（放假）即使落在周一至周五也**跳过**；
+2. 无显式声明时按**周末默认规则**：周一至周五为工作日，周六周日休息；
+3. 每个枚举日返回：日期、星期、是否周末、工作/休息判定（`kind=work|rest`）、补班/放假声明及名称（`declaration=workday|holiday`）、规则来源（`calendar_declared|weekend_default`）、周末默认规则文案、**累计工作日数**（休息日不增长）与**跳过原因**（含机器可读 `skip_reason_code`：`DECLARED_HOLIDAY_SKIPPED` / `DECLARED_HOLIDAY_ON_WEEKEND` / `WEEKEND_DEFAULT_REST`）；
+4. 直到第 N 个工作日停止，并返回当天 `cutoff` 的**当地截止时刻**（`deadline_local`，保留正确的 DST 偏移）与 **UTC 截止时刻**（`deadline_utc`）。
+
+响应只读且可重复：含 `days_enumerated`（枚举总天数）、`rest_days_skipped`（跳过天数）、`business_days_counted=N`、`read_only=true`，不写日历、政策、订单、事件或凭证。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/calendars/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "calendar_code": "CN",
+    "timezone": "Asia/Shanghai",
+    "start_at": "2025-10-01T10:00:00+08:00",
+    "business_days": 10,
+    "cutoff": "18:00"
+  }'
+```
+
+响应节选（2025 国庆+中秋黄金周：10 个工作日落在 **2025-10-21**）：
+
+```json
+{
+  "calendar_code": "CN",
+  "timezone": "Asia/Shanghai",
+  "start_at_local": "2025-10-01T10:00:00+08:00",
+  "start_at_utc": "2025-10-01T02:00:00+00:00",
+  "start_date_local": "2025-10-01",
+  "count_from": "2025-10-02",
+  "business_days_requested": 10,
+  "cutoff_local": "18:00:00",
+  "weekend_default_rule": "周一至周五工作，周六周日休息；节假日表显式声明优先",
+  "nth_business_day": "2025-10-21",
+  "deadline_local": "2025-10-21T18:00:00+08:00",
+  "deadline_utc": "2025-10-21T10:00:00+00:00",
+  "days_enumerated": 20,
+  "business_days_counted": 10,
+  "rest_days_skipped": 10,
+  "read_only": true,
+  "days": [
+    {"date": "2025-10-02", "weekday": "周四", "is_weekend": false, "kind": "rest",
+     "declaration": "holiday", "declaration_name": "国庆节、中秋节",
+     "rule_source": "calendar_declared",
+     "weekend_default_rule": "周一至周五工作，周六周日休息",
+     "cumulative_business_days": 0,
+     "skip_reason_code": "DECLARED_HOLIDAY_SKIPPED",
+     "skip_reason": "节假日表显式放假（国庆节、中秋节），虽为工作日也跳过",
+     "reason": "节假日表显式放假（国庆节、中秋节），虽为工作日也跳过"}
+  ]
+}
+```
+
+其余要点：补班落在周末同样计入（如 2025-01-26 周日春节补班：锚点 1/23 起 2 个工作日即 1/26）；提交时区决定"当地日期"的归属（同一 UTC 时刻在 +08:00 与 UTC 下可能对应不同起始日）；`America/New_York` 等时区在 DST 切换后 `deadline_local` 自动带上切换后的偏移（如 `-04:00`）。诊断功能也已加入 `python examples/call_api.py` 的第 9 段演示。
+
 ## 设计取舍与扩展
 
 - **存储**：SQLite + 进程内互斥锁，事件"顺序校验 + 插入"在单事务内完成；水平扩展或多副本时把 `app/db.py` 换成 Postgres（事件表加 `(order_id, arrived_at)` 约束即可）。
@@ -360,7 +432,14 @@ curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/claims \
 - **新增理赔类型/扫描事件**：在 `constants.py` 登记标签、政策 JSON 增规则、`engine.py` 增加一个 resolver，接口与代际机制无需改动。
 - 截止钟点默认 23:59:59，可被政策窗口级 `cutoff` 或环境变量 `CLAIM_DEFAULT_CUTOFF` 覆盖。
 
-### 本轮变动（v1.1.0）
+### v1.2.0 变动（节假日表诊断）
+
+- 新增**只读**诊断接口 `POST /api/v1/calendars/diagnose`：提交日历代码、IANA 时区、带偏移起始时刻、1～60 个工作日与当地截止钟点；从起始日次日起逐日返回日期、星期、工作/休息判定、补班/放假声明及名称、周末默认规则、规则来源、累计工作日数与跳过原因（含代码），直到第 N 个工作日，并返回第 N 天截止钟点的当地时刻与 UTC 时刻。
+- 口径与理赔引擎完全一致：补班（`workday`）落在周末也计入，放假（`holiday`）落在工作日也跳过；无声明按周一至周五/周六周日。起始时刻按提交时区换算当地日期，DST 切换后偏移自动正确。
+- 明确拒绝：naive 起始时间 / 缺字段 / 天数非 1～60 / 钟点非法 -> 422 `INVALID_REQUEST`；时区无法识别 -> 422 `TIMEZONE_INVALID`；日历不存在 -> 404 `CALENDAR_NOT_FOUND`。
+- 纯只读：不建表、不改 schema，不写日历、政策、订单、事件或凭证；Compose 启动流程（`init_db.py` 幂等初始化后起服务）与既有全部接口**保持不变**，老数据目录直接重启即可使用。测试由 68 个增至 88 个。
+
+### v1.1.0 变动
 
 - 新增理赔申请能力：`POST /orders/{id}/claims`（幂等受理）、`GET /orders/{id}/claims`、`GET /claims/{claim_no}`；新增只追加表 `claim_vouchers`（建表语句带 `IF NOT EXISTS`，老数据目录重启即自动升级，历史数据不受影响）。
 - 核验以**服务实际接收时间**为准实时重算，即使当前代已归档也不采用归档快照；接收时刻之后到达的事件不计入依据。

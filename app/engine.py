@@ -72,9 +72,21 @@ def resolve_policy(order_created_utc: datetime) -> dict:
 # ---------------------------------------------------------------- 节假日日历
 
 def _calendar_map(calendar_code: str) -> dict[str, str]:
+    return {d: item["kind"] for d, item in _calendar_entries(calendar_code).items()}
+
+
+def _calendar_entries(calendar_code: str) -> dict[str, dict]:
+    """读取现有节假日表（只读）：{YYYY-MM-DD: {"kind": ..., "name": ...}}。"""
     from .db import q
-    rows = q("SELECT date, kind FROM calendars WHERE calendar_code = ?", (calendar_code,))
-    return {r["date"]: r["kind"] for r in rows}
+    rows = q("SELECT date, kind, name FROM calendars WHERE calendar_code = ?",
+             (calendar_code,))
+    return {r["date"]: {"kind": r["kind"], "name": r["name"] or ""} for r in rows}
+
+
+def calendar_exists(calendar_code: str) -> bool:
+    from .db import q1
+    return q1("SELECT 1 FROM calendars WHERE calendar_code = ? LIMIT 1",
+              (calendar_code,)) is not None
 
 
 def is_business_day(d: date, calendar_code: str) -> bool:
@@ -123,6 +135,128 @@ def compute_deadline(
         due_date = local_anchor.date() + timedelta(days=days)
     due_local = datetime.combine(due_date, cutoff, tzinfo=ZoneInfo(tzname))
     return due_local.astimezone(UTC)
+
+
+# ---------------------------------------------------------------- 节假日表诊断
+
+WEEKDAY_ZH = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+DIAG_MAX_BUSINESS_DAYS = 60
+# 逐日枚举的安全上限：60 个工作日在"做四休三"等极端日历下也远用不了 366 天，
+# 超过即说明日历数据异常（例如补班声明缺失导致永远数不够），直接报错而非死循环。
+DIAG_MAX_ELAPSED_DAYS = 366
+
+
+def diagnose_calendar(
+    start_utc: datetime,
+    tzname: str,
+    calendar_code: str,
+    business_days: int,
+    cutoff: time,
+) -> dict:
+    """只读诊断：从起始时刻所在当地日的次日起逐日列出判定，直到第 N 个工作日。
+
+    - 节假日表显式声明优先：holiday 落在工作日也跳过，workday（补班）落在周末也计入；
+    - 无声明时按周末默认规则（周一至周五工作，周六周日休息）；
+    - 全程只读：不修改日历、政策、订单或凭证；
+    - 返回第 N 个工作日当天 cutoff 的当地时刻与 UTC 时刻。
+    """
+    local_start = to_local(start_utc, tzname)
+    start_date = local_start.date()
+    cal = _calendar_entries(calendar_code)
+
+    days: list[dict] = []
+    cur = start_date
+    counted = 0
+    elapsed = 0
+    while counted < business_days:
+        cur += timedelta(days=1)
+        elapsed += 1
+        if elapsed > DIAG_MAX_ELAPSED_DAYS:
+            raise RuntimeError(
+                f"在 {DIAG_MAX_ELAPSED_DAYS} 天内未能数满 {business_days} 个工作日，"
+                f"请检查节假日表 {calendar_code} 的声明是否完整")
+
+        iso = cur.isoformat()
+        weekday = cur.weekday()
+        is_weekend = weekday >= 5
+        entry = cal.get(iso)
+        declared = entry["kind"] if entry else None      # holiday | workday | None
+        declared_name = entry["name"] if entry else ""
+
+        if declared == "holiday":
+            is_work = False
+            rule_source = "calendar_declared"
+            declaration = "holiday"
+            if is_weekend:
+                skip_reason_code = "DECLARED_HOLIDAY_ON_WEEKEND"
+                reason = f"节假日表显式放假（{declared_name}），本为周末默认休息日，仍不计入"
+            else:
+                skip_reason_code = "DECLARED_HOLIDAY_SKIPPED"
+                reason = f"节假日表显式放假（{declared_name}），虽为工作日也跳过"
+        elif declared == "workday":
+            is_work = True
+            rule_source = "calendar_declared"
+            declaration = "workday"
+            if is_weekend:
+                skip_reason_code = None
+                reason = f"节假日表显式补班（{declared_name}），虽为周末也计入工作日"
+            else:
+                skip_reason_code = None
+                reason = f"节假日表显式补班（{declared_name}），计入工作日"
+        elif is_weekend:
+            is_work = False
+            rule_source = "weekend_default"
+            declaration = None
+            skip_reason_code = "WEEKEND_DEFAULT_REST"
+            reason = "周末默认规则：周六、周日休息，跳过"
+        else:
+            is_work = True
+            rule_source = "weekend_default"
+            declaration = None
+            skip_reason_code = None
+            reason = "周末默认规则：周一至周五为工作日，计入"
+
+        if is_work:
+            counted += 1
+        days.append({
+            "date": iso,
+            "weekday": WEEKDAY_ZH[weekday],
+            "is_weekend": is_weekend,
+            "kind": "work" if is_work else "rest",
+            "declaration": declaration,
+            "declaration_name": declared_name or None,
+            "rule_source": rule_source,
+            "weekend_default_rule": "周一至周五工作，周六周日休息",
+            "cumulative_business_days": counted,
+            "skip_reason_code": skip_reason_code,
+            "skip_reason": None if is_work else reason,
+            "reason": reason,
+        })
+
+    nth_date = date.fromisoformat(days[-1]["date"])
+    deadline_local = datetime.combine(nth_date, cutoff, tzinfo=ZoneInfo(tzname))
+    deadline_utc = deadline_local.astimezone(UTC)
+
+    skipped = sum(1 for d in days if d["kind"] == "rest")
+    return {
+        "calendar_code": calendar_code,
+        "timezone": tzname,
+        "start_at_local": local_start.isoformat(),
+        "start_at_utc": start_utc.isoformat(),
+        "start_date_local": start_date.isoformat(),
+        "count_from": (start_date + timedelta(days=1)).isoformat(),
+        "business_days_requested": business_days,
+        "cutoff_local": cutoff.strftime("%H:%M:%S"),
+        "weekend_default_rule": "周一至周五工作，周六周日休息；节假日表显式声明优先",
+        "nth_business_day": days[-1]["date"],
+        "deadline_local": deadline_local.isoformat(),
+        "deadline_utc": deadline_utc.isoformat(),
+        "days_enumerated": len(days),
+        "business_days_counted": counted,
+        "rest_days_skipped": skipped,
+        "days": days,
+        "read_only": True,
+    }
 
 
 # ---------------------------------------------------------------- 事件物化
